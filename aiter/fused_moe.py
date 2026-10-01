@@ -37,6 +37,7 @@ from aiter.jit.utils.chip_info import (
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
+from aiter.ops.flydsl import moe_sorting as _flydsl_moe_sorting_mod
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -595,6 +596,42 @@ def _flydsl_moe_sorting(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
+def _flydsl_fused_topk_moe_sorting(
+    topk_ids,
+    topk_weights,
+    num_experts,
+    model_dim,
+    moebuf_dtype,
+    block_size,
+    accumulate=True,
+    output=None,
+):
+    """Fused-sort dispatch for decode-sized M (<=16, no expert_mask) -- see
+    aiter.ops.flydsl.moe_sorting.flydsl_fused_topk_moe_sort. Mirrors
+    _flydsl_moe_sorting's moe_buf allocation (expert_mask is always None
+    here, since the caller's gate check already excludes expert_mask)."""
+    from aiter.ops.flydsl.moe_sorting import flydsl_fused_topk_moe_sort
+
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    if accumulate:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+
+    return flydsl_fused_topk_moe_sort(
+        topk_ids,
+        topk_weights,
+        moe_buf=moe_buf,
+        num_experts=num_experts,
+        unit_size=int(block_size),
+    )
+
+
 def moe_sorting(
     topk_ids,
     topk_weights,
@@ -611,6 +648,26 @@ def moe_sorting(
     output_aux=False,
     output=None,
 ):
+    if (
+        not _USE_CK_MOE_SORTING
+        and _flydsl_moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT
+        and not return_local_topk_ids
+        and not flat
+        and not output_aux
+        and dispatch_policy == 0
+        and expert_mask is None
+        and topk_ids.shape[0] <= 16
+    ):
+        return _flydsl_fused_topk_moe_sorting(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            model_dim,
+            moebuf_dtype,
+            block_size,
+            accumulate=accumulate,
+            output=output,
+        )
     if (
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING

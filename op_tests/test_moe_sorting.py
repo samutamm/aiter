@@ -25,12 +25,19 @@ def set_moe_sorting_backend(backend: str) -> None:
     if backend == "flydsl":
         fm._USE_CK_MOE_SORTING = False
         fm._USE_FLYDSL_MOE_SORTING = True
+        fm._flydsl_moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT = False
+    elif backend == "fused_topk":
+        fm._USE_CK_MOE_SORTING = False
+        fm._USE_FLYDSL_MOE_SORTING = True
+        fm._flydsl_moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT = True
     elif backend == "opus":
         fm._USE_CK_MOE_SORTING = False
         fm._USE_FLYDSL_MOE_SORTING = False
+        fm._flydsl_moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT = False
     elif backend == "ck":
         fm._USE_CK_MOE_SORTING = True
         fm._USE_FLYDSL_MOE_SORTING = False
+        fm._flydsl_moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT = False
     elif backend == "auto":
         pass
     else:
@@ -350,6 +357,24 @@ def test_moe_sorting(
             dispatch_policy,
             accumulate=accumulate,
         )
+        # Fused topk/sort gate (moe_sorting() dispatch): dispatch_policy=0,
+        # no expert_mask, decode-sized M<=16 -- see
+        # aiter/fused_moe.py::moe_sorting()'s _flydsl_fused_topk_moe_sorting
+        # branch. Outside the gate it silently falls through to "flydsl"'s
+        # candidate above, so only add it when it's actually exercised.
+        if not has_expert_mask and token <= 16:
+            candidates["fused_topk"] = lambda: moe_sorting(
+                topk_ids,
+                topk_weights,
+                E,
+                model_dim,
+                dtype,
+                BLOCK_SIZE_M,
+                expert_mask,
+                num_local_tokens,
+                dispatch_policy,
+                accumulate=accumulate,
+            )
 
     flops, nbytes = _moe_sorting_roofline(token, topk, E, model_dim, dtype)
     ret = {"gfx": get_gfx(), "routing case": routing_case}
@@ -497,6 +522,8 @@ def test_moe_sorting_invalid_topk_ids():
         # FlyDSL LDS oneshot and HBM multiphase mesh stores.
         ("flydsl", 8, 0, False),
         ("flydsl", 2048, 0, False),
+        # Fused topk/sort gate (decode-sized M<=16, no expert_mask).
+        ("fused_topk", 8, 0, False),
     )
 
     for backend, token, dispatch_policy, has_expert_mask in direct_cases:
