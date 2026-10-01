@@ -16,6 +16,9 @@ import torch
 
 import aiter.ops.flydsl.moe_sorting as moe_sorting_mod
 from aiter.ops.flydsl.moe_sorting import (
+    flydsl_fused_topk_moe_sort,
+    flydsl_moe_sorting_fwd,
+    fused_topk_gating,
     fused_topk_softmax_moe_sort,
     sequential_topk_softmax_moe_sort,
 )
@@ -27,6 +30,22 @@ torch.set_default_device("cuda")
 def set_fused_topk_moe_sort_backend(enabled: bool) -> None:
     """Force the fused_topk_softmax_moe_sort fast-path gate for a test."""
     moe_sorting_mod._USE_FUSED_TOPK_MOE_SORT = enabled
+
+
+def sequential_topk_gating(gating_logits, bias=None, topk=8, scoring_func="softmax", need_renorm=True):
+    """Gating-only reference, shared by this file's gating tests and
+    sequential_topk_softmax_moe_sort's combined reference: the HIP
+    topk_gating op, unconditionally (no fast-path gate)."""
+    from aiter.ops.topk import topk_gating
+
+    M = gating_logits.shape[0]
+    device = gating_logits.device
+    topk_w = torch.empty(M, topk, dtype=torch.float32, device=device)
+    topk_i = torch.empty(M, topk, dtype=torch.int32, device=device)
+    topk_gating(
+        topk_w, topk_i, gating_logits, bias, need_renorm=need_renorm, score_func=scoring_func
+    )
+    return topk_w, topk_i
 
 
 def _compare(ref, out, topk, num_rows, unit_size, label):
@@ -168,9 +187,147 @@ def test_fused_topk_moe_sort_gate_off_matches_reference():
     _compare(ref, out, topk, M, unit_size, "gate off")
 
 
+def _run_gating_case(M, E, topk, scoring_func, has_bias, need_renorm=True):
+    gating_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
+    bias = None
+    if has_bias:
+        bias = torch.randn(E, dtype=torch.float32, device="cuda") * 0.1
+
+    ref_w, ref_i = sequential_topk_gating(
+        gating_logits, bias=bias, topk=topk, scoring_func=scoring_func, need_renorm=need_renorm
+    )
+
+    set_fused_topk_moe_sort_backend(True)
+    try:
+        out_w, out_i = fused_topk_gating(
+            gating_logits, bias=bias, topk=topk, scoring_func=scoring_func, need_renorm=need_renorm
+        )
+    finally:
+        set_fused_topk_moe_sort_backend(False)
+
+    label = f"M={M} E={E} topk={topk} func={scoring_func} bias={has_bias}"
+    assert out_i.shape == ref_i.shape, f"[{label}] topk_indices shape mismatch"
+    errs = {
+        "topk_indices": checkAllclose(ref_i, out_i, atol=0, msg=f"{label} topk_indices"),
+        "topk_weights": checkAllclose(ref_w, out_w, msg=f"{label} topk_weights"),
+    }
+    bad = {k: v for k, v in errs.items() if v}
+    assert not bad, f"[{label}] mismatch: {bad}"
+    print(f"[PASS] gating {label}")
+
+
+def test_fused_topk_gating_decode_shapes():
+    """Gating-only fast-path correctness across decode batch sizes and shapes."""
+    shapes = [(896, 16), (64, 8)]
+    for (E, topk), M, scoring_func, has_bias in itertools.product(
+        shapes, (1, 2, 4, 8, 16), ("softmax", "sigmoid"), (False, True)
+    ):
+        _run_gating_case(M, E, topk, scoring_func, has_bias)
+
+
+def test_fused_topk_gating_softmax_no_renorm_falls_back():
+    """scoring_func='softmax', need_renorm=False must fall back (can't
+    recover the true un-renormalized weight from only the K selected
+    logits), matching the HIP topk_gating reference exactly."""
+    _run_gating_case(4, 64, 8, "softmax", has_bias=False, need_renorm=False)
+
+
+def test_fused_topk_gating_prefill_fallback_matches_reference():
+    """M > 16 (prefill) must take the fallback path regardless of the gate."""
+    M, E, topk = 32, 64, 8
+    gating_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
+    ref_w, ref_i = sequential_topk_gating(gating_logits, topk=topk, scoring_func="softmax")
+
+    set_fused_topk_moe_sort_backend(True)
+    try:
+        out_w, out_i = fused_topk_gating(gating_logits, topk=topk, scoring_func="softmax")
+    finally:
+        set_fused_topk_moe_sort_backend(False)
+
+    checkAllclose(ref_i, out_i, atol=0, msg="prefill fallback topk_indices")
+    checkAllclose(ref_w, out_w, msg="prefill fallback topk_weights")
+
+
+def test_fused_topk_gating_gate_off_matches_reference():
+    """With the env gate off, fused_topk_gating must reproduce the HIP
+    topk_gating baseline exactly even for decode-sized M."""
+    M, E, topk = 8, 64, 8
+    gating_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
+    ref_w, ref_i = sequential_topk_gating(gating_logits, topk=topk, scoring_func="softmax")
+
+    set_fused_topk_moe_sort_backend(False)
+    out_w, out_i = fused_topk_gating(gating_logits, topk=topk, scoring_func="softmax")
+
+    checkAllclose(ref_i, out_i, atol=0, msg="gate off topk_indices")
+    checkAllclose(ref_w, out_w, msg="gate off topk_weights")
+
+
+def _run_sort_only_case(M, E, topk, unit_size, enable_gate):
+    gating_logits = torch.randn(M, E, dtype=torch.float32, device="cuda")
+    topk_w, topk_i = sequential_topk_gating(gating_logits, topk=topk, scoring_func="softmax")
+
+    device = gating_logits.device
+    _, sorted_ids_a, sorted_weights_a, sorted_expert_ids_a, num_valid_ids_a, moe_buf = (
+        moe_sorting_mod._alloc_sort_outputs(
+            M, E, topk, unit_size, device, None, None, None, None, None
+        )
+    )
+
+    flydsl_moe_sorting_fwd(
+        topk_i,
+        topk_w,
+        sorted_ids_a,
+        sorted_weights_a,
+        sorted_expert_ids_a,
+        num_valid_ids_a,
+        moe_buf,
+        E,
+        unit_size,
+    )
+    ref = (sorted_ids_a, sorted_weights_a, sorted_expert_ids_a, num_valid_ids_a, moe_buf)
+
+    set_fused_topk_moe_sort_backend(enable_gate)
+    try:
+        out = flydsl_fused_topk_moe_sort(
+            topk_i, topk_w, num_experts=E, unit_size=unit_size
+        )
+    finally:
+        set_fused_topk_moe_sort_backend(False)
+
+    label = f"M={M} E={E} topk={topk} unit={unit_size} gate={enable_gate}"
+    _compare(ref, out, topk, M, unit_size, label)
+    print(f"[PASS] sort-only {label}")
+
+
+def test_flydsl_fused_topk_moe_sort_decode_shapes():
+    """Sort-only fast-path correctness: fused sort kernel vs the generic
+    FlyDSL sort (flydsl_moe_sorting_fwd), given identical topk_ids/weights."""
+    shapes = [(896, 16, 32), (64, 8, 32)]
+    for (E, topk, unit_size), M in itertools.product(shapes, (1, 2, 4, 8, 16)):
+        _run_sort_only_case(M, E, topk, unit_size, enable_gate=True)
+
+
+def test_flydsl_fused_topk_moe_sort_prefill_fallback_matches_reference():
+    """M > 16 (prefill) must take the fallback path regardless of the gate."""
+    _run_sort_only_case(32, 64, 8, 32, enable_gate=True)
+
+
+def test_flydsl_fused_topk_moe_sort_gate_off_matches_reference():
+    """With the env gate off, flydsl_fused_topk_moe_sort must reproduce
+    flydsl_moe_sorting_fwd exactly even for decode-sized M."""
+    _run_sort_only_case(8, 64, 8, 32, enable_gate=False)
+
+
 if __name__ == "__main__":
     test_fused_topk_moe_sort_decode_shapes()
     test_fused_topk_moe_sort_softmax_no_renorm_falls_back()
     test_fused_topk_moe_sort_prefill_fallback_matches_reference()
     test_fused_topk_moe_sort_gate_off_matches_reference()
+    test_fused_topk_gating_decode_shapes()
+    test_fused_topk_gating_softmax_no_renorm_falls_back()
+    test_fused_topk_gating_prefill_fallback_matches_reference()
+    test_fused_topk_gating_gate_off_matches_reference()
+    test_flydsl_fused_topk_moe_sort_decode_shapes()
+    test_flydsl_fused_topk_moe_sort_prefill_fallback_matches_reference()
+    test_flydsl_fused_topk_moe_sort_gate_off_matches_reference()
     print("All fused_topk_softmax_moe_sort tests passed.")

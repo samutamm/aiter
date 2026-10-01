@@ -174,55 +174,48 @@ def sequential_topk_softmax_moe_sort(
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
 
 
-def fused_topk_softmax_moe_sort(
-    gating_logits,
+def fused_topk_gating(
+    gating_output,
     bias=None,
     topk=8,
-    unit_size=32,
     scoring_func="softmax",
     need_renorm=True,
-    sorted_ids=None,
-    sorted_weights=None,
-    sorted_expert_ids=None,
-    num_valid_ids=None,
-    moe_buf=None,
-    stream=None,
 ):
-    """Top-k gating + MoE token sorting, fused into one fast path for decode.
+    """Top-k gating: selects experts and their weights for each token.
 
-    For small batches (M <= 16), this picks the top-k experts and normalizes
-    their weights in PyTorch, then sorts tokens by expert with one FlyDSL
-    kernel call -- skipping the usual round-trip of topk_ids/topk_weights
-    through a separate sort kernel.
+    Returns (topk_weights, topk_indices), shape [M, topk] each.
 
-    It falls back to the normal sequential path
-    (:func:`sequential_topk_softmax_moe_sort`) when: the env-var gate is off,
-    M > 16 (prefill, since the sort kernel assumes each expert fits in one
-    tile), a correction bias is supplied (bias can change which experts get
-    picked, so this isn't supported in the fast path yet), or scoring_func is
+    Fast path (M<=16, no bias, scoring_func in {softmax-with-renorm, sigmoid}):
+    selective top-k + in-PyTorch softmax/sigmoid renorm. This is exact, not
+    approximate: softmax(selected_z) only needs the selected logits because
+    the excluded experts' exp() terms cancel out of both numerator and
+    denominator once normalized over just the top-k set; sigmoid weights are
+    independent per expert, so renormalizing over the top-k subset is exact
+    by construction.
+
+    Falls back to aiter.ops.topk.topk_gating (HIP) when: the env-var gate is
+    off, M > 16 (prefill, where the fast path offers no benefit), a
+    correction bias is supplied (bias can change which experts get picked,
+    so this isn't supported in the fast path yet), or scoring_func is
     "softmax" without renormalization (the un-renormalized weight needs the
     full set of experts, not just the selected top-k).
 
     Args:
-        gating_logits: [M, E] float32 router logits.
+        gating_output: [M, E] float32 router logits.
         bias: optional [E] correction bias (routes to the fallback path).
         topk: experts routed per token.
-        unit_size: GEMM tile-M for padding alignment.
         scoring_func: "softmax" or "sigmoid" (anything else routes to the
             fallback path, which also accepts "sqrtsoftplus" via topk_gating).
         need_renorm: renormalize the top-k weights to sum to 1.
-        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf:
-            optional pre-allocated output buffers (see flydsl_moe_sorting_fwd).
-        stream: optional torch.cuda.Stream for kernel launch.
 
     Returns:
-        (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+        (topk_weights, topk_indices), each [M, topk].
     """
-    assert gating_logits.dim() == 2, (
-        f"gating_logits must be 2D [M, E], got shape {tuple(gating_logits.shape)}"
+    assert gating_output.dim() == 2, (
+        f"gating_output must be 2D [M, E], got shape {tuple(gating_output.shape)}"
     )
-    M, E = gating_logits.shape
-    device = gating_logits.device
+    M, E = gating_output.shape
+    device = gating_output.device
     has_bias = bias is not None and bias.numel() > 0
     scoring_supported = scoring_func == "sigmoid" or (
         scoring_func == "softmax" and need_renorm
@@ -232,35 +225,75 @@ def fused_topk_softmax_moe_sort(
     )
 
     if not use_fast_path:
-        return sequential_topk_softmax_moe_sort(
-            gating_logits,
-            bias=bias,
-            topk=topk,
-            unit_size=unit_size,
-            scoring_func=scoring_func,
+        topk_w = torch.empty(M, topk, dtype=torch.float32, device=device)
+        topk_i = torch.empty(M, topk, dtype=torch.int32, device=device)
+
+        from ..topk import topk_gating
+
+        topk_gating(
+            topk_w,
+            topk_i,
+            gating_output,
+            bias,
             need_renorm=need_renorm,
-            sorted_ids=sorted_ids,
-            sorted_weights=sorted_weights,
-            sorted_expert_ids=sorted_expert_ids,
-            num_valid_ids=num_valid_ids,
-            moe_buf=moe_buf,
+            score_func=scoring_func,
         )
+        return topk_w, topk_i
 
     # --- Fast path: selective top-k + in-PyTorch softmax/sigmoid renorm ---
     if scoring_func == "softmax":
-        topk_indices = torch.topk(gating_logits, k=topk, dim=-1, sorted=True)[1].to(
+        topk_indices = torch.topk(gating_output, k=topk, dim=-1, sorted=True)[1].to(
             torch.int32
         )
-        selected_z = gating_logits.gather(1, topk_indices.to(torch.int64))
+        selected_z = gating_output.gather(1, topk_indices.to(torch.int64))
         topk_w = torch.softmax(selected_z, dim=-1)
     else:  # scoring_func == "sigmoid"
-        choice_scores = torch.sigmoid(gating_logits)
+        choice_scores = torch.sigmoid(gating_output)
         topk_indices = torch.topk(choice_scores, k=topk, dim=-1, sorted=True)[1].to(
             torch.int32
         )
-        selected_z = gating_logits.gather(1, topk_indices.to(torch.int64))
+        selected_z = gating_output.gather(1, topk_indices.to(torch.int64))
         raw_w = torch.sigmoid(selected_z)
         topk_w = raw_w / raw_w.sum(dim=-1, keepdim=True) if need_renorm else raw_w
+
+    return topk_w, topk_indices
+
+
+def flydsl_fused_topk_moe_sort(
+    topk_ids,
+    topk_weights,
+    sorted_ids=None,
+    sorted_weights=None,
+    sorted_expert_ids=None,
+    num_valid_ids=None,
+    moe_buf=None,
+    num_experts=None,
+    unit_size=32,
+    stream=None,
+):
+    """Sort-only fast path: same inputs/outputs as flydsl_moe_sorting_fwd, but
+    uses the single-block compact-binning kernel
+    (kernels/fused_topk_moe_sort_kernel.py) instead of the generic
+    multi-phase/oneshot sort.
+
+    Gate: the env-var gate is on and M = topk_ids.shape[0] <= 16. Falls back
+    to flydsl_moe_sorting_fwd otherwise.
+
+    Args:
+        topk_ids: [M, topk] int32 selected expert indices.
+        topk_weights: [M, topk] float32 selected expert weights.
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf:
+            optional pre-allocated output buffers (see flydsl_moe_sorting_fwd).
+        num_experts: total number of experts E.
+        unit_size: GEMM tile-M for padding alignment.
+        stream: optional torch.cuda.Stream for kernel launch.
+
+    Returns:
+        (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    """
+    M, topk = topk_ids.shape
+    E = num_experts
+    device = topk_ids.device
 
     max_blocks, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = (
         _alloc_sort_outputs(
@@ -276,6 +309,21 @@ def fused_topk_softmax_moe_sort(
             moe_buf,
         )
     )
+
+    if not (_USE_FUSED_TOPK_MOE_SORT and M <= 16):
+        flydsl_moe_sorting_fwd(
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            E,
+            unit_size,
+        )
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
     if moe_buf.numel() > 0:
         moe_buf.zero_()
 
@@ -292,8 +340,8 @@ def fused_topk_softmax_moe_sort(
         num_experts=E, topk=topk, unit_size=unit_size
     )
     launcher(
-        topk_indices.flatten(),
-        topk_w.flatten(),
+        topk_ids.flatten(),
+        topk_weights.flatten(),
         sorted_ids,
         sorted_weights,
         sorted_expert_ids,
@@ -305,3 +353,70 @@ def fused_topk_softmax_moe_sort(
     )
 
     return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
+
+
+def fused_topk_softmax_moe_sort(
+    gating_logits,
+    bias=None,
+    topk=8,
+    unit_size=32,
+    scoring_func="softmax",
+    need_renorm=True,
+    sorted_ids=None,
+    sorted_weights=None,
+    sorted_expert_ids=None,
+    num_valid_ids=None,
+    moe_buf=None,
+    stream=None,
+):
+    """Top-k gating + MoE token sorting, composed from the standalone
+    :func:`fused_topk_gating` and :func:`flydsl_fused_topk_moe_sort` pieces.
+
+    Kept around for tests/benchmarks and for callers that want gating+sort in
+    one call; the dispatch call sites (vLLM's router, aiter's
+    fused_moe.py::moe_sorting()) call the two pieces independently instead,
+    since that's how a real MoE forward pass is structured (gating at the
+    router, sorting later at expert-dispatch, with other work such as
+    expert-parallel masking potentially happening in between).
+
+    Args:
+        gating_logits: [M, E] float32 router logits.
+        bias: optional [E] correction bias (routes gating to the fallback
+            path; see fused_topk_gating).
+        topk: experts routed per token.
+        unit_size: GEMM tile-M for padding alignment.
+        scoring_func: "softmax" or "sigmoid" (anything else routes gating to
+            the fallback path, which also accepts "sqrtsoftplus" via
+            topk_gating).
+        need_renorm: renormalize the top-k weights to sum to 1.
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf:
+            optional pre-allocated output buffers (see flydsl_moe_sorting_fwd).
+        stream: optional torch.cuda.Stream for kernel launch.
+
+    Returns:
+        (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
+    """
+    assert gating_logits.dim() == 2, (
+        f"gating_logits must be 2D [M, E], got shape {tuple(gating_logits.shape)}"
+    )
+    E = gating_logits.shape[1]
+
+    topk_w, topk_i = fused_topk_gating(
+        gating_logits,
+        bias=bias,
+        topk=topk,
+        scoring_func=scoring_func,
+        need_renorm=need_renorm,
+    )
+    return flydsl_fused_topk_moe_sort(
+        topk_i,
+        topk_w,
+        sorted_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        moe_buf=moe_buf,
+        num_experts=E,
+        unit_size=unit_size,
+        stream=stream,
+    )
