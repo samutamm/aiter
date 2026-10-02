@@ -34,40 +34,85 @@ See /home/stammine/repos/brains/Arete/export/topk_gating_softmax_moe_sort_fusion
 - Create a detailed plan into tasks/topk_gating_softmax_moe_sort_fusion/plan.md and try to iron-out few details.
 - Let me check the plan, then implement.
 
-## Known gap (deferred): correction_bias support in the fast path
+## correction_bias support in the fast path — WORK IN PROGRESS, NEEDED (not optional)
 
-`fused_topk_softmax_moe_sort`'s fast path (aiter/ops/flydsl/moe_sorting.py) always
-falls back to the sequential `topk_gating` + `flydsl_moe_sorting_fwd` path whenever
+**Update:** this is not an acceptable gap to leave deferred — it's load-bearing.
+Kimi-K3's real router (`vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py`)
+always passes `e_score_correction_bias` into `fused_topk_gating`. With the gate
+below, `has_bias` is therefore always `True` on the one model this whole task
+was built for, so `use_fast_path` was always `False` in production — the e2e A/B
+benchmark (`silo-tiger-oob-benchmark-configs/runs/mi355x/kimi_k3/sweep/2026-10-01_1300/summary.md`)
+never actually exercised the new kernel; both arms of that sweep ran the
+identical sequential fallback, which is why it only showed noise-level (~0.5-1%,
+inconsistent sign) deltas instead of the Arete campaign's reported +1.6%. Fixing
+this is the next concrete step before re-running the e2e sweep.
+
+Previously `fused_topk_softmax_moe_sort`'s fast path (aiter/ops/flydsl/moe_sorting.py) always
+fell back to the sequential `topk_gating` + `flydsl_moe_sorting_fwd` path whenever
 a correction `bias` is supplied, regardless of the env gate / M / scoring_func:
 
 ```python
 use_fast_path = _USE_FUSED_TOPK_MOE_SORT and M <= 16 and not has_bias and scoring_supported
 ```
 
-Why: bias is added to the score *before* top-k selection (confirmed against
-`aiter/ops/topk.py`'s `biased_grouped_topk_torch`: `scores_for_choice = sigmoid(logit)
-+ bias`, selection happens on the biased score, but the returned weights are gathered
-from the *raw* unbiased score and then renormalized). The fast path's "evaluate only
-the K selected experts" shortcut relies on selecting via `torch.topk` on the raw
-logits — supporting bias would mean re-deriving/replicating `topk_gating`'s exact
-correction-bias selection semantics in PyTorch, which was judged out of scope for
-this pass (see tasks/topk_gating_softmax_moe_sort_fusion/plan.md, "Not in scope for
-this pass").
+Why this was gapped originally: bias is added to the score *before* top-k
+selection (confirmed against `aiter/ops/topk.py`'s `biased_grouped_topk_torch`:
+`scores_for_choice = sigmoid(logit) + bias`, selection happens on the biased
+score, but the returned weights are gathered from the *raw* unbiased score and
+then renormalized). The no-bias fast path's "evaluate only the K selected
+experts" shortcut relies on selecting via `torch.topk` on the raw logits —
+bias breaks that shortcut because it can reorder the *full* E-expert ranking,
+not just perturb the already-selected top-k, so it requires a full softmax/
+sigmoid over all E experts before selection.
 
-Practical consequence: the microbenchmark (op_tests/bench_fused_topk_moe_sort.py)
-must be run with `bias=None` to actually exercise the new fused kernel. A benchmark
-that passes a non-empty bias (as the reference Arete export's
-`kernel/bench_fused_topk_moe_sorting.py` does) ends up comparing the sequential
-fallback path against itself for both "sequential" and "fused" candidates — the new
-kernel never runs — so such a benchmark would be measuring noise, not a real
-comparison.
+Practical consequence (now fixed): the microbenchmark
+(op_tests/bench_fused_topk_moe_sort.py) previously had to be run with
+`bias=None` to actually exercise the new fused kernel — a benchmark passing a
+non-empty bias (as the reference Arete export's
+`kernel/bench_fused_topk_moe_sorting.py` does) compared the sequential fallback
+path against itself for both "sequential" and "fused" candidates.
 
-Follow-up (not yet implemented): add a bias-aware fast path — compute
-`scores_for_choice = score(logits) + bias` for selection, then gather raw
-(unbiased) scores for the top-k indices and renormalize, matching
-`biased_grouped_topk_torch`'s semantics — so bias-routed decode calls (e.g.
-Llama4/DeepSeek-style `sigmoid` + `correction_bias` routing) can also use the
-fused kernel instead of always falling back.
+**Implemented:** `_fused_topk_gating_biased()` in `aiter/ops/flydsl/moe_sorting.py`,
+matching `csrc/include/topk_gating_kernels.cuh`'s HIP kernel semantics exactly
+(not `biased_grouped_topk_torch`, which additionally does expert-group masking
+that Kimi-K3's flat `topk_gating` path doesn't use):
+
+```
+unbiased_score = softmax(logits) or sigmoid(logits)   # full E, no shortcut
+biased_score   = unbiased_score + bias
+indices        = topk(biased_score)
+weight         = gather(unbiased_score, indices)
+weight        /= weight.sum(-1)                        # if need_renorm
+```
+
+`use_fast_path` no longer excludes `has_bias` — it now dispatches to
+`_fused_topk_gating_biased` when a bias is present, and the existing
+selective-softmax path otherwise. This trades away the no-bias path's "only
+touch the K winners" compute saving when bias is present (a full-E softmax is
+unavoidable once bias can reorder the whole ranking) — the win is still fewer
+kernel launches feeding the fused sort kernel, same as the no-bias case, not
+less total math.
+
+Test coverage: `op_tests/test_fused_topk_moe_sort.py`'s existing
+`has_bias=True` cases in `test_fused_topk_moe_sort_decode_shapes` /
+`test_fused_topk_gating_decode_shapes` previously passed trivially (fallback
+compared against itself); they now exercise the real bias-aware fast path
+against the HIP `topk_gating` reference. Added
+`test_fused_topk_gating_biased_matches_kernel_semantics_directly`, which
+checks `_fused_topk_gating_biased`'s output against a from-scratch
+reimplementation of the kernel's bias math (independent of
+`sequential_topk_gating`/HIP, so a bug shared between the fast path and the
+op-level fallback wouldn't hide behind only comparing the two aiter paths to
+each other), and a large-bias stress case
+(`test_fused_topk_gating_biased_reorders_selection`) that uses a deliberately
+large-magnitude bias to assert the selected expert set actually changes vs.
+the unbiased top-k (catches an implementation that silently ignores bias for
+selection but still appears to "pass" on random small-bias inputs where the
+selected set rarely changes).
+
+Still out of scope (unchanged from before): grouped topk (`num_expert_group`),
+`sqrtsoftplus` scoring, and `need_renorm=False` for softmax — all three still
+route to the HIP fallback.
 
 ## Microbenchmark results (op_tests/bench_fused_topk_moe_sort.py, gbt350-odcdh2-c05-1.png-odc.dcgpu, vllm/vllm-openai-rocm:nightly-rocm100-36768d1bfd39094681cdbc8cb37d4b31c0729c89)
 
